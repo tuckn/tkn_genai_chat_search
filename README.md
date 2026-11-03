@@ -97,18 +97,10 @@ flowchart LR
 
 ### 2.2. インストール
 
-ターミナルで次を実行します。
+ターミナルで次を実行します。clone は不要です。
 
 ```shell
 uv tool install git+https://github.com/tuckn/tkn_genai_chat_search
-```
-
-手元に clone したリポジトリから入れる場合は、そのフォルダへ移動してから実行します。
-`C:\path\to\tkn_genai_chat_search` は clone した場所に置き換えます。
-
-```shell
-cd "C:\path\to\tkn_genai_chat_search"
-uv tool install .
 ```
 
 導入できたかを確かめます。
@@ -354,19 +346,13 @@ defaults:
 
 ## 9. 更新
 
-GitHub から入れた場合は、次で最新版に入れ替えます。
+次で GitHub の `main` の最新版に入れ替えます。clone や `git pull` は不要です。
 
 ```shell
 uv tool install --reinstall git+https://github.com/tuckn/tkn_genai_chat_search
 ```
 
-clone したリポジトリから入れた場合は、`git pull` の後に、そのフォルダで次を実行します。
-
-```shell
-cd "C:\path\to\tkn_genai_chat_search"
-uv tool install . --reinstall
-```
-
+入るのは GitHub に push 済みの内容だけです。
 更新後は `tkn-genai-chat-search --version` でバージョンを確かめます。
 変更点は [CHANGELOG.md](CHANGELOG.md) に記載しています。
 
@@ -382,7 +368,9 @@ uv build
 ```
 
 テストは一時フォルダに作った架空のログだけを使い、実際のログは読みません。
-編集中のコードをそのまま使うには `uv tool install -e . --reinstall` で入れます。
+clone した手元のコードを試すには、そのフォルダで `uv tool install . --reinstall` を実行します（`C:\path\to\tkn_genai_chat_search` は clone した場所に置き換えます）。
+編集中のコードを再インストールなしで反映させるには `uv tool install -e . --reinstall` で入れます。
+その後に GitHub から入れ直すと、インストールされた CLI は GitHub の内容に戻り、手元の未 push の変更は含まれなくなります。
 リポジトリでの作業の決まりは [AGENTS.md](AGENTS.md) にあります。
 
 ## 11. 関連ドキュメント
