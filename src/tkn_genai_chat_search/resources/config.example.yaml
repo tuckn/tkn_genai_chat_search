@@ -1,0 +1,28 @@
+# tkn-genai-chat-search の設定ファイル
+# `tkn-genai-chat-search config init` が作成します。schema_version 以外は省略できます。
+schema_version: "1.0.0"
+
+# 読み取る場所（各アプリの設定フォルダ）。null は既定の場所を使います。
+#   codex: 環境変数 CODEX_HOME、なければ ~/.codex
+#   claude_code: 環境変数 CLAUDE_CONFIG_DIR、なければ ~/.claude
+# 一覧を書くと既定の場所の代わりになります。相対パスは実行時のフォルダから解決します。
+# 例: codex: ['C:\path\to\.codex', 'D:\path\to\other\.codex']
+roots:
+  codex: null
+  claude_code: null
+
+# list・search・show の既定値。コマンドラインのオプションはその1回だけ上書きします。
+defaults:
+  # 返すsessionの最大数。0 は無制限です。
+  limit: 10
+  # 並べる基準（created: 最初の発言、updated: 最後の発言）と向き（asc / desc）。
+  sort_by: updated
+  order: desc
+  # search で1つのsessionから出す、話者ごとの発言数の目安。一致した発言は数を超えても出します。0 はすべてです。
+  messages_per_role: 8
+  # 一致した発言の前後から出す発言数。
+  context_messages: 1
+  # 1つの抜粋の最大文字数。0 は省略しません。
+  max_message_chars: 1200
+  # --date-from・--date-to の日付の区切りに使うUTCとの時差。例: "+09:00"
+  utc_offset: "+00:00"
