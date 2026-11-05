@@ -43,7 +43,7 @@ archived_sessions/...
 
 本文は文字列か、`text`・`input_text` を持つ要素の配列から取り出します。
 ユーザー発言から、Codex が付け足す AGENTS.md の指示・`<INSTRUCTIONS>`・`<environment_context>` を取り除き、`## My request for Codex:` があればその後だけを使います。
-`developer` の発言、ツールの呼び出しと結果、reasoning、`world_state` などは読みません。
+`developer` の発言、reasoning、`world_state` などは読みません。ツールの呼び出しと結果は、検索では読みません（ライブラリで `detail=True` のときだけ読みます。5節）。
 
 ### 2.3. 会話の種類
 
@@ -94,7 +94,7 @@ projects/<encoded-project>/<session-id>/subagents/agent-<agent-id>.jsonl
 | ユーザー発言の中の `<system-reminder>…</system-reminder>` | Claude Code が付け足した文脈として取り除きます。それだけの発言は除外して同じく数えます |
 | その他の記録（system、summary、progress など） | 読まずに種類ごとに `details.ignored_record_types` に数えます |
 
-- `tool_use`・`tool_result`・`thinking`・画像の要素は、中に `text` があっても本文にしません。
+- `tool_use`・`tool_result`・`thinking`・画像の要素は、中に `text` があっても本文にしません（ツールの要素は、ライブラリで `detail=True` のときだけ読みます。5節）。
 - `(role, uuid, 本文)` が完全に同じ発言は1回だけ残します（`details.duplicate_messages`）。UUID がない発言は重複を判定しません。
 - 表示の順はファイルの行の順です。`parentUuid` をたどって分岐を選び直すことはしません。
 
@@ -103,6 +103,26 @@ projects/<encoded-project>/<session-id>/subagents/agent-<agent-id>.jsonl
 - `subagents/` の下と `agent-*.jsonl` のファイル、またはすべての発言が sidechain のファイルは `subagent` です。親は `subagents/` の上のフォルダ名、古い形式では最初の記録の `sessionId` です。
 - 通常の会話の中の `isSidechain` の発言は、`--include-subagents` がなければ除外します（`excluded_sidechain_messages`）。
 - 別の会話から引き継いだ発言は、記録された `sessionId` を `messages[].session_id` に残します。`--session-id` はファイルの session ID と親の ID だけに一致します。
+
+## 5. ライブラリとして読む（ツール実行と発言の書き手）
+
+アーカイブなど、アプリのフォルダ以外から1つのログを読むツールは、`tkn_genai_chat_search.library` の関数を使います。検索と同じ読み取りの処理を使い、ファイルを開きません。`path` はバイト列の名前（アーカイブの相対パスなど）で、session ID と種類をファイル名と同じ規則で決めます。
+
+| 関数 | 内容 |
+| --- | --- |
+| `read_claude_code(data, path, detail=True)` | Claude Code の会話1つ。`LogRead(session, coverage, error)` を返す |
+| `read_codex(data, path, titles=None, detail=True)` | Codex の rollout 1つ（`.jsonl.zst` は先頭のマジックナンバーで展開） |
+| `read_codex_titles(data, path)` | `session_index.jsonl` のバイト列からタイトル。読めない行があれば `TitleStore.status` が `partial` で、`detail` に件数 |
+| `claude_code_transcript_kind(path)`・`codex_rollout_status(path)` | 相対パスが会話のファイルか（`main`・`subagent`／`active`・`archived`）。古い形式の `agent-*.jsonl` は `subagent` |
+
+`LogRead.coverage` は、フォルダを読むときと同じ件数（`files_discovered`・`files_read`・`sessions_read` など）を、1つのログについて数えたものです。テキストの発言がなくても、`detail=True` でツール実行があれば `Session` を返します。
+
+`detail=True` のとき、`Session` に次が入ります。検索の出力（`summary()`・`messages[]`）は変わりません。
+
+- `tool_events`（`ToolEvent`）：ツール実行。`call_id`・`name`・`arguments`・`timestamp`・`line_number`・`turn_id`・`cwd`・`status`・`is_error`・`result_line_number`・`output_chars`・`error_preview`（失敗時の先頭200文字）。
+  - Claude Code：assistant の `tool_use` と、user の `tool_result` を `id` と `tool_use_id` で組にします。`is_error` は `tool_result.is_error`。結果のない実行は `result_line_number` が `None` です。
+  - Codex：`function_call`・`custom_tool_call`・`local_shell_call`・`web_search_call`・`tool_search_call` と、その `*_output` を `call_id` で組にします（`origin: call`）。出力の `metadata.exit_code` か `Exit code: n` の行があれば `is_error` にします。`event_msg` の `exec_command_end`・`patch_apply_end` も結果に反映します。`event_msg` の `item_completed`（`CommandExecution`・`FileChange`・`McpToolCall`・`WebSearch` など）は、それだけで1回の実行として扱います（`origin: item`。`exit_code`・`status` から `is_error`）。会話・reasoning・モードの切り替えの item は除きます。
+- `message_attributes`：Claude Code のユーザー発言の行ごとに、書き手を示す項目（`turnOrigin`・`promptSource`・`entrypoint`・`userType`・`isSidechain`）。別のセッションから渡された依頼文は `turnOrigin` が `human` 以外になります。
 
 ## 4. 実データでの確認
 

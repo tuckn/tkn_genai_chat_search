@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from ..models import Message, Session, SourceCoverage, Title, TitleStore
+from ..models import Message, Session, SourceCoverage, Title, TitleStore, ToolEvent
 from ..normalize import parse_timestamp, timestamp_sort_key, title_key
 from .base import (
     LOGGER,
@@ -23,6 +23,8 @@ from .base import (
     Root,
     file_format,
     iter_records,
+    result_text,
+    source_label,
     string,
     unreadable,
     walk_files,
@@ -35,6 +37,31 @@ ROLLOUT_NAME = re.compile(rf"({_UUID})(?:_({_UUID}))?\.jsonl(?:\.zst)?$", re.IGN
 STATE_DB = re.compile(r"^state_(\d+)\.sqlite$")
 APPROVAL_REVIEW_PREFIX = "The following is the Codex agent history"
 REVIEW_THREAD_SOURCES = {"approval_review", "guardian_review"}
+# Response items that call a tool, and the items that carry their results (paired by call_id).
+CALL_TYPES = {"function_call", "custom_tool_call", "local_shell_call", "web_search_call", "tool_search_call"}
+OUTPUT_TYPES = {"function_call_output", "custom_tool_call_output", "local_shell_call_output", "tool_search_output"}
+# item_completed items that are conversation, reasoning or mode changes rather than a tool execution.
+NON_TOOL_ITEMS = {
+    "UserMessage",
+    "AgentMessage",
+    "Reasoning",
+    "ContextCompaction",
+    "EnteredReviewMode",
+    "ExitedReviewMode",
+}
+ITEM_ARGUMENT_FIELDS = (
+    "command",
+    "cwd",
+    "parsed_cmd",
+    "changes",
+    "server",
+    "tool",
+    "arguments",
+    "query",
+    "path",
+    "kind",
+)
+ERROR_PREVIEW_CHARS = 200
 
 
 class CodexReader:
@@ -111,6 +138,24 @@ def titled_ids(titles: dict[str, list[Title]], keys: tuple[str, ...]) -> set[str
         for session_id, entries in titles.items()
         if all(any(key in title_key(t.title) for t in entries) for key in keys)
     }
+
+
+def titles_from_index(
+    path: Path, coverage: SourceCoverage, data: bytes | None = None
+) -> tuple[dict[str, list[Title]], TitleStore]:
+    """Thread names from one `session_index.jsonl`, or its bytes named by `path`."""
+    titles: dict[str, list[Title]] = {}
+    store = TitleStore(source_label(path, data), "read")
+    for line_number, row in iter_records(path, coverage, data):
+        value = row.get("thread_name")
+        session_id = string(row.get("id"))
+        if not isinstance(value, str) or not value.strip() or not session_id:
+            continue
+        entries = titles.setdefault(session_id.casefold(), [])
+        entries[:] = [t for t in entries if not (t.kind == "thread-name" and t.title == value)]
+        entries.append(Title("thread-name", value, store.path, line_number))
+        store.titles += 1
+    return titles, store
 
 
 def load_titles(home: Path, coverage: SourceCoverage) -> dict[str, list[Title]]:
@@ -229,14 +274,27 @@ def normalize_message_text(value: str) -> str:
 
 
 def read_rollout(
-    path: Path, coverage: SourceCoverage, archive_status: str, titles: dict[str, list[Title]]
+    path: Path,
+    coverage: SourceCoverage,
+    archive_status: str,
+    titles: dict[str, list[Title]],
+    *,
+    data: bytes | None = None,
+    detail: bool = False,
 ) -> Session | None:
+    """Read one rollout file, or `data` named by `path` (for example a version from an archive).
+
+    With `detail`, the session also carries tool executions: calls paired with their outputs by
+    `call_id`, and the executions that `item_completed` events describe.
+    """
     meta: dict[str, Any] | None = None
     messages: list[Message] = []
     seen: set[tuple[str, str, str]] = set()
     turn_id = ""
     turn_cwd = ""
-    source_path = str(path.absolute())
+    source_path = source_label(path, data)
+    tools: dict[str, ToolEvent] = {}
+    tool_order: list[str] = []
 
     def append(line_number: int, role: str, text: str, timestamp: str, phase: str, message_id: str, turn: str) -> None:
         if role == "user":
@@ -263,7 +321,7 @@ def read_rollout(
             )
         )
 
-    for line_number, obj in iter_records(path, coverage):
+    for line_number, obj in iter_records(path, coverage, data):
         event_type = obj.get("type")
         raw_payload = obj.get("payload")
         payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
@@ -283,6 +341,13 @@ def read_rollout(
             turn_id = string(payload.get("turn_id"))
             turn_cwd = string(payload.get("cwd")) or string((meta or {}).get("cwd"))
             continue
+        if detail and event_type in {"response_item", "event_msg"}:
+            context = {
+                "turn": turn_id,
+                "cwd": turn_cwd or string((meta or {}).get("cwd")),
+                "session": string((meta or {}).get("id")),
+            }
+            collect_tool(payload, line_number, timestamp, context, tools, tool_order)
         if event_type == "response_item":
             role = payload.get("role")
             if role in {"user", "assistant"} and payload.get("type", "message") == "message":
@@ -322,7 +387,8 @@ def read_rollout(
     if meta is None:
         coverage.files_without_sessions += 1
         return None
-    if not messages:
+    if not messages and not tools:
+        # With detail, a rollout of tool executions only (no text) still records them.
         coverage.files_without_messages += 1
         return None
     session_id = string(meta.get("id")) or string(meta.get("session_id"))
@@ -343,6 +409,7 @@ def read_rollout(
         updated=max(dated, key=timestamp_sort_key) if dated else "",
         paths=[source_path],
         messages=messages,
+        tool_events=[tools[key] for key in tool_order],
         details={
             "archive_status": archive_status,
             "rollout_segment": segment,
@@ -352,6 +419,139 @@ def read_rollout(
             "repository_url": string(git.get("repository_url")),
         },
     )
+
+
+def collect_tool(
+    payload: dict[str, Any],
+    line_number: int,
+    timestamp: str,
+    context: dict[str, str],
+    tools: dict[str, ToolEvent],
+    order: list[str],
+) -> None:
+    kind = string(payload.get("type"))
+    if kind in CALL_TYPES:
+        call_id = string(payload.get("call_id")) or string(payload.get("id"))
+        if not call_id or call_id in tools:
+            return
+        arguments: Any = payload.get("arguments", payload.get("input", payload.get("action")))
+        if isinstance(arguments, str) and kind == "function_call":
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                pass
+        tools[call_id] = ToolEvent(
+            call_id=call_id,
+            name=string(payload.get("name")) or kind,
+            arguments=arguments,
+            timestamp=timestamp,
+            line_number=line_number,
+            session_id=context["session"],
+            turn_id=context["turn"],
+            cwd=context["cwd"],
+            status=string(payload.get("status")),
+        )
+        order.append(call_id)
+    elif kind in OUTPUT_TYPES:
+        event = tools.get(string(payload.get("call_id")))
+        if event is None or event.result_line_number is not None:
+            return
+        output = payload.get("output")
+        exit_code: int | None = None
+        if isinstance(output, dict):
+            metadata = output.get("metadata")
+            if isinstance(metadata, dict) and isinstance(metadata.get("exit_code"), int):
+                exit_code = int(metadata["exit_code"])
+            text = result_text(output.get("content", output.get("output")))
+        else:
+            text = result_text(output)
+        if exit_code is None:
+            exit_code = _exit_code(text)
+        event.result_line_number = line_number
+        event.result_timestamp = timestamp
+        event.output_chars = len(text)
+        if exit_code is not None:
+            event.is_error = exit_code != 0
+            if event.is_error:
+                event.error_preview = text[:ERROR_PREVIEW_CHARS]
+    elif kind in {"exec_command_end", "patch_apply_end"}:
+        event = tools.get(string(payload.get("call_id")))
+        if event is not None:
+            code = payload.get("exit_code")
+            failed = (isinstance(code, int) and code != 0) or payload.get("success") is False
+            event.is_error = failed
+            if event.result_line_number is None:
+                output = string(payload.get("aggregated_output")) or string(payload.get("stdout"))
+                event.result_line_number = line_number
+                event.result_timestamp = timestamp
+                event.output_chars = len(output) if output else None
+            if failed:
+                event.error_preview = (string(payload.get("stderr")) or string(payload.get("aggregated_output")))[
+                    :ERROR_PREVIEW_CHARS
+                ]
+    elif kind == "item_completed" and isinstance(payload.get("item"), dict):
+        item: dict[str, Any] = payload["item"]
+        name = string(item.get("type"))
+        call_id = string(item.get("id"))
+        if not name or name in NON_TOOL_ITEMS or not call_id:
+            return
+        code = item.get("exit_code")
+        status = string(item.get("status"))
+        output = string(item.get("aggregated_output")) or string(item.get("stdout"))
+        existing = tools.get(call_id)
+        if existing is not None:
+            # The completion of a call collected earlier: fill in what its own records did not give.
+            if existing.result_line_number is None:
+                existing.result_line_number = line_number
+                existing.result_timestamp = timestamp
+                existing.output_chars = len(output) if output else None
+            if existing.is_error is None and (isinstance(code, int) or status):
+                existing.is_error = (isinstance(code, int) and code != 0) or status in {"failed", "declined", "error"}
+                if existing.is_error:
+                    existing.error_preview = (string(item.get("stderr")) or output)[:ERROR_PREVIEW_CHARS]
+            existing.status = existing.status or status
+            return
+        item_failed: bool | None = None
+        if isinstance(code, int) or status:
+            item_failed = (isinstance(code, int) and code != 0) or status in {"failed", "declined", "error"}
+        tools[call_id] = ToolEvent(
+            call_id=call_id,
+            name=name,
+            arguments={key: item[key] for key in ITEM_ARGUMENT_FIELDS if key in item},
+            timestamp=timestamp,
+            line_number=line_number,
+            origin="item",
+            session_id=context["session"],
+            turn_id=string(payload.get("turn_id")) or context["turn"],
+            cwd=context["cwd"],
+            status=status,
+            is_error=item_failed,
+            result_line_number=line_number,
+            result_timestamp=timestamp,
+            output_chars=len(output) if output else None,
+            error_preview=(string(item.get("stderr")) or output)[:ERROR_PREVIEW_CHARS] if item_failed else "",
+        )
+        order.append(call_id)
+
+
+# Only a status line of the shell runner counts, not text that mentions an exit code.
+_EXIT_CODE = re.compile(r"^(?:Process exited with code|Exit code:)\s*(-?\d+)\s*$", re.MULTILINE)
+
+
+def _exit_code(text: str) -> int | None:
+    """Exit code of a shell output: `{"metadata": {"exit_code": n}}` or an `Exit code: n` line."""
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        try:
+            value = json.loads(stripped)
+        except ValueError:
+            value = None
+        metadata = value.get("metadata") if isinstance(value, dict) else None
+        if isinstance(metadata, dict) and isinstance(metadata.get("exit_code"), int):
+            return int(metadata["exit_code"])
+    head = "\n".join(text.splitlines()[:5])
+    match = _EXIT_CODE.search(head)
+    return int(match.group(1)) if match else None
 
 
 def classify(meta: dict[str, Any], messages: list[Message]) -> tuple[str, str, str]:

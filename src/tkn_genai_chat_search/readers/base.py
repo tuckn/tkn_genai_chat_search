@@ -17,6 +17,7 @@ from ..models import SourceCoverage
 
 LOGGER = logging.getLogger("tkn_genai_chat_search")
 
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 # Errors that make one file unreadable without stopping the scan.
 READ_ERRORS: tuple[type[BaseException], ...] = (OSError, UnicodeError, EOFError, zstandard.ZstdError)
 
@@ -94,9 +95,22 @@ def walk_files(
             yield folder / name
 
 
-def iter_records(path: Path, coverage: SourceCoverage) -> Iterator[tuple[int, dict[str, Any]]]:
-    """Yield `(line_number, object)` for each JSON object line; count and skip malformed lines."""
-    with open_text(path) as stream:
+def open_bytes(data: bytes) -> IO[str]:
+    """Text over bytes already read (for example from an archive); zstd is detected by its magic number."""
+    if data.startswith(ZSTD_MAGIC):
+        with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data), read_across_frames=True) as reader:
+            data = reader.read()
+    return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8-sig")
+
+
+def iter_records(
+    path: Path, coverage: SourceCoverage, data: bytes | None = None
+) -> Iterator[tuple[int, dict[str, Any]]]:
+    """Yield `(line_number, object)` for each JSON object line; count and skip malformed lines.
+
+    With `data`, the bytes are read instead of the file; `path` then only names them.
+    """
+    with open_text(path) if data is None else open_bytes(data) as stream:
         for line_number, line in enumerate(stream, 1):
             if not line.strip():
                 continue
@@ -125,3 +139,25 @@ def unreadable(coverage: SourceCoverage, path: Path, exc: BaseException) -> None
 
 def string(value: Any) -> str:
     return value if isinstance(value, str) else ""
+
+
+def source_label(path: Path, data: bytes | None) -> str:
+    """The absolute file path, or the given name as is for bytes that did not come from a file."""
+    return str(path.absolute()) if data is None else str(path).replace("\\", "/")
+
+
+def result_text(content: Any) -> str:
+    """Text of a tool result: a string, or the text parts of a list of content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text") if isinstance(block.get("text"), str) else block.get("input_text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return ""

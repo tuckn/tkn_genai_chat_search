@@ -39,6 +39,37 @@ class Message:
 
 
 @dataclass
+class ToolEvent:
+    """One tool execution, with its result when the log has one. Only read with `detail=True`.
+
+    `origin` is `call` for a call/result record pair (Claude Code `tool_use`/`tool_result`,
+    Codex `function_call`/`custom_tool_call` and their outputs) and `item` for a Codex
+    `item_completed` record, which describes one finished execution by itself.
+    """
+
+    call_id: str
+    name: str
+    arguments: Any
+    timestamp: str
+    line_number: int
+    origin: str = "call"
+    session_id: str = ""
+    turn_id: str = ""
+    cwd: str = ""
+    is_sidechain: bool = False
+    agent_id: str = ""
+    status: str = ""
+    is_error: bool | None = None
+    result_line_number: int | None = None
+    result_timestamp: str = ""
+    output_chars: int | None = None
+    error_preview: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class Session:
     source: str
     session_id: str
@@ -51,6 +82,10 @@ class Session:
     paths: list[str]
     messages: list[Message]
     details: dict[str, Any] = field(default_factory=dict)
+    # Filled only when a reader is called with detail=True; never part of summary() or search output.
+    tool_events: list[ToolEvent] = field(default_factory=list)
+    # Per message line: application fields that tell who wrote a turn (e.g. Claude Code turnOrigin).
+    message_attributes: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def title(self) -> str:

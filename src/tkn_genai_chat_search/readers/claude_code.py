@@ -9,9 +9,21 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from ..models import Message, Session, SourceCoverage, Title
+from ..models import Message, Session, SourceCoverage, Title, ToolEvent
 from ..normalize import parse_timestamp, timestamp_sort_key
-from .base import LOGGER, READ_ERRORS, ReadOptions, Root, file_format, iter_records, record_warning, string, unreadable
+from .base import (
+    LOGGER,
+    READ_ERRORS,
+    ReadOptions,
+    Root,
+    file_format,
+    iter_records,
+    record_warning,
+    result_text,
+    source_label,
+    string,
+    unreadable,
+)
 
 # Session title records and the field that holds each title.
 TITLE_RECORDS = {"custom-title": "customTitle", "ai-title": "aiTitle"}
@@ -19,6 +31,9 @@ TITLE_RECORDS = {"custom-title": "customTitle", "ai-title": "aiTitle"}
 SKIPPED_PROJECT_FOLDERS = {"memory", "tool-results", "mcp-tasks"}
 SET_ASIDE_MARKER = ".orphaned-"
 SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>\s*", re.DOTALL)
+# Fields of a user record that tell who wrote the turn (a person, another session, a hook ...).
+TURN_FIELDS = ("turnOrigin", "promptSource", "entrypoint", "userType", "isSidechain")
+ERROR_PREVIEW_CHARS = 200
 
 
 class ClaudeCodeReader:
@@ -130,19 +145,31 @@ def content_text(content: Any) -> str:
     return ""
 
 
-def read_transcript(path: Path, coverage: SourceCoverage) -> Session | None:
+def read_transcript(
+    path: Path, coverage: SourceCoverage, *, data: bytes | None = None, detail: bool = False
+) -> Session | None:
+    """Read one transcript file, or `data` named by `path` (for example a version from an archive).
+
+    With `detail`, the session also carries tool executions (`tool_use` paired with `tool_result`
+    by ID) and, per kept message line, the fields that tell who wrote a turn.
+    """
     details = coverage.details
-    ignored: Counter[str] = details["ignored_record_types"]
+    for counter in ("excluded_generated_messages", "duplicate_messages", "non_text_messages"):
+        details.setdefault(counter, 0)
+    ignored: Counter[str] = details.setdefault("ignored_record_types", Counter())
     messages: list[Message] = []
     seen: set[tuple[str, str, str]] = set()
     recorded_ids: set[str] = set()
     titles: list[Title] = []
+    tools: dict[str, ToolEvent] = {}
+    tool_order: list[str] = []
+    attributes: dict[int, dict[str, Any]] = {}
     session_id = transcript_id(path)
     subagent_file = is_subagent_path(path)
     agent_id = path.stem.removeprefix("agent-") if subagent_file else ""
     parent_id = path.parent.parent.name if path.parent.name == "subagents" else ""
-    source_path = str(path.absolute())
-    for line_number, row in iter_records(path, coverage):
+    source_path = source_label(path, data)
+    for line_number, row in iter_records(path, coverage, data):
         kind = string(row.get("type"))
         if kind in TITLE_RECORDS and row.get("sessionId") == session_id:
             value = string(row.get(TITLE_RECORDS[kind]))
@@ -158,10 +185,12 @@ def read_transcript(path: Path, coverage: SourceCoverage) -> Session | None:
             recorded_ids.add(recorded)
         if not parent_id and subagent_file:
             parent_id = recorded
+        message = row.get("message")
+        if detail and isinstance(message, dict):
+            collect_tools(row, message, line_number, tools, tool_order, agent_id)
         if row.get("isMeta") or row.get("isCompactSummary"):
             details["excluded_generated_messages"] += 1
             continue
-        message = row.get("message")
         if not isinstance(message, dict) or message.get("role", kind) != kind:
             record_warning(coverage, path, line_number, "unsupported message envelope")
             continue
@@ -181,6 +210,8 @@ def read_transcript(path: Path, coverage: SourceCoverage) -> Session | None:
             details["duplicate_messages"] += 1
             continue
         seen.add(key)
+        if detail and kind == "user":
+            attributes[line_number] = {name: row[name] for name in TURN_FIELDS if isinstance(row.get(name), str | bool)}
         messages.append(
             Message(
                 role=kind,
@@ -196,11 +227,16 @@ def read_transcript(path: Path, coverage: SourceCoverage) -> Session | None:
                 agent_id=string(row.get("agentId")) or agent_id,
             )
         )
-    if not messages:
+    if not messages and not tools:
+        # With detail, a transcript of tool calls only (no text) still records executions.
         return None
     primary = [m for m in messages if not m.is_sidechain] or messages
     dated = [m.timestamp for m in primary if parse_timestamp(m.timestamp) is not None]
-    kind = "subagent" if subagent_file or all(m.is_sidechain for m in messages) else "main"
+    if messages:
+        sidechain_only = all(m.is_sidechain for m in messages)
+    else:  # A tool-only transcript (detail) is classified by its executions.
+        sidechain_only = all(event.is_sidechain for event in tools.values())
+    kind = "subagent" if subagent_file or sidechain_only else "main"
     return Session(
         source="claude-code",
         session_id=session_id,
@@ -213,4 +249,53 @@ def read_transcript(path: Path, coverage: SourceCoverage) -> Session | None:
         paths=[source_path],
         messages=messages,
         details={"agent_id": agent_id, "recorded_session_ids": sorted(recorded_ids)},
+        tool_events=[tools[key] for key in tool_order],
+        message_attributes=attributes,
     )
+
+
+def collect_tools(
+    row: dict[str, Any],
+    message: dict[str, Any],
+    line_number: int,
+    tools: dict[str, ToolEvent],
+    order: list[str],
+    agent_id: str,
+) -> None:
+    """Pair `tool_use` blocks of assistant records with `tool_result` blocks of user records."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    timestamp = string(row.get("timestamp"))
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use" and string(block.get("id")):
+            call_id = string(block.get("id"))
+            if call_id in tools:
+                continue
+            tools[call_id] = ToolEvent(
+                call_id=call_id,
+                name=string(block.get("name")),
+                arguments=block.get("input"),
+                timestamp=timestamp,
+                line_number=line_number,
+                session_id=string(row.get("sessionId")),
+                cwd=string(row.get("cwd")),
+                is_sidechain=bool(row.get("isSidechain")),
+                agent_id=string(row.get("agentId")) or agent_id,
+            )
+            order.append(call_id)
+        elif block.get("type") == "tool_result":
+            event = tools.get(string(block.get("tool_use_id")))
+            if event is None or event.result_line_number is not None:
+                continue
+            output = result_text(block.get("content"))
+            failed = bool(block.get("is_error"))
+            event.is_error = failed
+            event.status = "failed" if failed else "completed"
+            event.result_line_number = line_number
+            event.result_timestamp = timestamp
+            event.output_chars = len(output)
+            if failed:
+                event.error_preview = output[:ERROR_PREVIEW_CHARS]

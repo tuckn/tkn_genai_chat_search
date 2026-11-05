@@ -18,6 +18,7 @@
 - Codex：`sessions`・`archived_sessions` の `.jsonl` と `.jsonl.zst` を読む。タイトルを `state_<n>.sqlite`（読み取り専用）と `session_index.jsonl` から読む。subagent と承認・guardian レビューを種類として区別する。
 - Claude Code：`projects` の会話と subagent、`custom-title`・`ai-title`（改名前を含む）を読む。ユーザー発言の `<system-reminder>` を取り除く。
 - 既定は、最後の発言が新しい順に10件。subagent とレビューは既定で除外する。
+- ライブラリ `tkn_genai_chat_search.library`：アーカイブなどから読んだバイト列を、検索と同じ読み取りで `Session` にする。`detail=True` でツール実行（Claude Code の `tool_use`/`tool_result`、Codex の呼び出しと出力を `call_id` で組にしたもの、`item_completed`）と、Claude Code の発言の書き手（`turnOrigin` など）も返す。検索の出力は変えない。
 
 ### 移行（`tkn-codex-plugins` の検索scriptからの違い）
 
